@@ -1,18 +1,5 @@
-# Compiled CUDA / C artifacts
 *.o
 *.out
 a.out
-*.exe
-/testing        # binary from `nvcc testing.cu -o testing`
-
-# Notebook checkpoints & caches
-.ipynb_checkpoints/
-__pycache__/
-*.pyc
-
-# OS cruft
+/testing
 .DS_Store
-
-# Local benchmark scratch (keep curated results, ignore raw dumps)
-benchmarks/*.log
-benchmarks/raw/
