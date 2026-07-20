@@ -1,8 +1,9 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
 
 __global__ void vectorADD(const float * A , const float * B , float * C , int n ){
-
     int i = blockDim.x * blockIdx.x + threadIdx.x;
     if( i < n){
         C[i] = A[i] + B[i];
@@ -16,9 +17,9 @@ int main (){
     float * h_a , *h_b , *h_c;
     float * d_a , *d_b , *d_c;
 
-    h_a = (float *)malloc(size);
-    h_b = (float *)malloc(size);
-    h_c = (float *)malloc(size);
+    cudaMallocHost((void**)&h_a, size);
+    cudaMallocHost((void**)&h_b, size);
+    cudaMallocHost((void**)&h_c, size);
 
     for(int i = 0 ; i<n ; i++){
         h_a[i] = rand() / (float)RAND_MAX;
@@ -34,23 +35,22 @@ int main (){
     cudaStreamCreate(&s1);
     cudaStreamCreate(&s2);
 
-    cudaMemcpyAsync(d_a , h_a , cudaMemcpyHostToDevice , s1);
-    cudaMemcpyAsync(d_b , h_b , cudaMemcpyHostToDevice , s2);
+    cudaMemcpyAsync(d_a , h_a , size, cudaMemcpyHostToDevice , s1);
+    cudaMemcpyAsync(d_b , h_b , size, cudaMemcpyHostToDevice , s2);
 
     cudaStreamSynchronize(s2);
 
     int thB = 256;
     int blockPerGrid = (n + thB - 1 )/thB;
 
-    vectorADD <<<blockPerGrid,thB , 0 ,s1>>> (d_a , d_b ,d_c ,n);
+    vectorADD <<<blockPerGrid, thB, 0, s1>>> (d_a , d_b , d_c, n);
 
-    cudaMemcpyAsync(h_c , d_c , size , cudaMemcpyDeviceToHost ,s1);
+    cudaMemcpyAsync(h_c , d_c , size, cudaMemcpyDeviceToHost, s1);
 
     cudaStreamSynchronize(s1);
-    cudaStreamSynchronize(s2);
 
-    for (int i = 0; i < numElements; ++i) {
-        if (fabs(h_A[i] + h_B[i] - h_C[i]) > 1e-5) {
+    for (int i = 0; i < n; ++i) {
+        if (fabs(h_a[i] + h_b[i] - h_c[i]) > 1e-5) {
             fprintf(stderr, "Result verification failed at element %d!\n", i);
             exit(EXIT_FAILURE);
         }
@@ -63,11 +63,11 @@ int main (){
     cudaFree(d_c);
 
     cudaStreamDestroy(s1);
-    cudaStreamDestory(s2);
+    cudaStreamDestroy(s2);
 
-    free(h_a);
-    free(h_b);
-    free(h_c);
-
-  
+    cudaFreeHost(h_a);
+    cudaFreeHost(h_b);
+    cudaFreeHost(h_c);
+    
+    return 0;
 }
