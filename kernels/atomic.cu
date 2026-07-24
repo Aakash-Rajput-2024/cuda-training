@@ -40,4 +40,4 @@ int main (){
     cudaFree(d_ca);
 
     return 0;
-}
+}         
