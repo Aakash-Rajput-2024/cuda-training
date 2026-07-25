@@ -3,8 +3,8 @@
 #include <cstdlib>
 #include <cmath>
 
-#define WARMUP 3
-#define ITTER 20
+#define WARMUP 2
+#define ITTER 10
 
 #define CUDA_CHECK(call) \
     do { \
@@ -15,15 +15,15 @@
         } \
     } while (0)
 
-template <int BS>
-__global__ void sgemm_shared(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
+__global__ void sgemm_shared_dynamic(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C, int BS) {
+    extern __shared__ float s[];
+    float *As = s;
+    float *Bs = s + BS * BS;
+
     int cRow = blockIdx.y;
     int cCol = blockIdx.x;
     int threadRow = threadIdx.y;
     int threadCol = threadIdx.x;
-
-    __shared__ float As[BS * BS];
-    __shared__ float Bs[BS * BS];
 
     A += cRow * BS * K;
     B += cCol * BS;
@@ -48,36 +48,43 @@ __global__ void sgemm_shared(int M, int N, int K, float alpha, const float *A, c
     C[threadRow * N + threadCol] = alpha * tmp + beta * C[threadRow * N + threadCol];
 }
 
-template <int BS>
-float bench_bs(int M, int N, int K, float alpha, const float *dA, const float *dB, float beta, float *dC, const float *dC_init) {
+bool test_launch(int BS, int M, int N, int K, float alpha, const float *dA, const float *dB, float beta, float *dC, float *dC_init, float &out_ms) {
+    if (BS * BS > 1024 || M % BS != 0 || N % BS != 0 || K % BS != 0) {
+        return false;
+    }
+
     dim3 block(BS, BS);
-    dim3 grid((N + BS - 1) / BS, (M + BS - 1) / BS);
+    dim3 grid(N / BS, M / BS);
+    size_t shared_mem_bytes = 2 * BS * BS * sizeof(float);
     size_t bytes = M * N * sizeof(float);
 
     for (int i = 0; i < WARMUP; i++) {
-        CUDA_CHECK(cudaMemcpy(dC, dC_init, bytes, cudaMemcpyDeviceToDevice));
-        sgemm_shared<BS><<<grid, block>>>(M, N, K, alpha, dA, dB, beta, dC);
+        cudaMemcpy(dC, dC_init, bytes, cudaMemcpyDeviceToDevice);
+        sgemm_shared_dynamic<<<grid, block, shared_mem_bytes>>>(M, N, K, alpha, dA, dB, beta, dC, BS);
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
 
     cudaEvent_t start, stop;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
 
-    CUDA_CHECK(cudaEventRecord(start));
+    cudaEventRecord(start);
     for (int i = 0; i < ITTER; i++) {
-        CUDA_CHECK(cudaMemcpy(dC, dC_init, bytes, cudaMemcpyDeviceToDevice));
-        sgemm_shared<BS><<<grid, block>>>(M, N, K, alpha, dA, dB, beta, dC);
+        cudaMemcpy(dC, dC_init, bytes, cudaMemcpyDeviceToDevice);
+        sgemm_shared_dynamic<<<grid, block, shared_mem_bytes>>>(M, N, K, alpha, dA, dB, beta, dC, BS);
     }
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
 
-    float ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
+    cudaEventElapsedTime(&out_ms, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 
-    return ms / ITTER;
+    out_ms /= ITTER;
+    return true;
 }
 
 int main() {
@@ -107,18 +114,28 @@ int main() {
     CUDA_CHECK(cudaMemcpy(dB, hB, sizeB, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dC_init, hC, sizeC, cudaMemcpyHostToDevice));
 
-    printf("BlockSize | Time (ms) | GFLOP/s\n");
-    printf("--------------------------------\n");
+    printf("Binary Searching for Highest Valid Block Size:\n");
+    int low = 1, high = 64;
+    int max_valid_bs = -1;
+    float best_ms = 0.0f;
 
-    auto print_row = [](int bs, float ms, int M, int N, int K) {
-        double gflops = (2.0 * M * N * K) / (ms * 1e6);
-        printf("  %2dx%-2d  |  %7.3f  | %7.1f\n", bs, bs, ms, gflops);
-    };
+    while (low <= high) {
+        int mid = low + (high - low) / 2;
+        float ms = 0.0f;
+        bool ok = test_launch(mid, M, N, K, alpha, dA, dB, beta, dC, dC_init, ms);
+        if (ok) {
+            double gflops = (2.0 * M * N * K) / (ms * 1e6);
+            printf("BS = %2d -> VALID   | Time: %7.3f ms | Throughput: %7.1f GFLOP/s\n", mid, ms, gflops);
+            max_valid_bs = mid;
+            best_ms = ms;
+            low = mid + 1;
+        } else {
+            printf("BS = %2d -> INVALID (Exceeds hardware limits / invalid config)\n", mid);
+            high = mid - 1;
+        }
+    }
 
-    print_row(4,  bench_bs<4>(M, N, K, alpha, dA, dB, beta, dC, dC_init), M, N, K);
-    print_row(8,  bench_bs<8>(M, N, K, alpha, dA, dB, beta, dC, dC_init), M, N, K);
-    print_row(16, bench_bs<16>(M, N, K, alpha, dA, dB, beta, dC, dC_init), M, N, K);
-    print_row(32, bench_bs<32>(M, N, K, alpha, dA, dB, beta, dC, dC_init), M, N, K);
+    printf("\nHighest Valid Block Size found: %dx%d (Time: %.3f ms)\n", max_valid_bs, max_valid_bs, best_ms);
 
     CUDA_CHECK(cudaFree(dA));
     CUDA_CHECK(cudaFree(dB));
