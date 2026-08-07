@@ -6,9 +6,6 @@
 
 #define CEIL_DIV(M, N) (((M) + (N) - 1) / (N))
 
-// =========================================================================
-// DEVICE KERNEL: Vectorized SGEMM (Kernel 6)
-// =========================================================================
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
 __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
 sgemmVectorize(int M, int N, int K, float alpha,
@@ -17,24 +14,22 @@ sgemmVectorize(int M, int N, int K, float alpha,
   const uint cRow = blockIdx.y;
   const uint cCol = blockIdx.x;
 
-  // ---- which 8x8 output tile does THIS thread own? ----
   const uint threadCol = threadIdx.x % (BN / TN);   // 0..15
   const uint threadRow = threadIdx.x / (BN / TN);   // 0..15
 
-  __shared__ float As[BK * BM];   // TRANSPOSED: As[k * BM + m]
-  __shared__ float Bs[BK * BN];   //      normal: Bs[k * BN + n]
+  __shared__ float As[BK * BM];   
+  __shared__ float Bs[BK * BN];   
 
-  // advance pointers to this block's tile
-  A += cRow * BM * K;             // A: (BM x K) strip
-  B += cCol * BN;                 // B: (K x BN) strip
+  A += cRow * BM * K;             
+  B += cCol * BN;                 
   C += cRow * BM * N + cCol * BN;
 
-  // ---- which float4 does THIS thread load? ----
-  const uint innerRowA = threadIdx.x / (BK / 4);   // BK/4 = 2  -> 0..127
-  const uint innerColA = threadIdx.x % (BK / 4);   //           -> 0..1
+
+  const uint innerRowA = threadIdx.x / (BK / 4);   
+  const uint innerColA = threadIdx.x % (BK / 4);   
   
-  const uint innerRowB = threadIdx.x / (BN / 4);   // BN/4 = 32 -> 0..7
-  const uint innerColB = threadIdx.x % (BN / 4);   //           -> 0..31
+  const uint innerRowB = threadIdx.x / (BN / 4);   
+  const uint innerColB = threadIdx.x % (BN / 4);   
 
   float threadResults[TM * TN] = {0.0};
   float regM[TM] = {0.0};
@@ -42,8 +37,6 @@ sgemmVectorize(int M, int N, int K, float alpha,
 
   for (uint bkIdx = 0; bkIdx < K; bkIdx += BK) {
 
-    // ================= GMEM -> SMEM =================
-    // A: one LDG.E.128, then transpose via 4 scalar STS
     float4 tmp =
         reinterpret_cast<float4 *>(&A[innerRowA * K + innerColA * 4])[0];
     As[(innerColA * 4 + 0) * BM + innerRowA] = tmp.x;
@@ -51,16 +44,16 @@ sgemmVectorize(int M, int N, int K, float alpha,
     As[(innerColA * 4 + 2) * BM + innerRowA] = tmp.z;
     As[(innerColA * 4 + 3) * BM + innerRowA] = tmp.w;
 
-    // B: one LDG.E.128 straight into one STS.128 (no transpose needed)
+    
     reinterpret_cast<float4 *>(&Bs[innerRowB * BN + innerColB * 4])[0] =
         reinterpret_cast<float4 *>(&B[innerRowB * N + innerColB * 4])[0];
 
     __syncthreads();
 
-    A += BK;        // slide right along K
-    B += BK * N;    // slide down  along K
+    A += BK;     
+    B += BK * N;    
 
-    // ================= SMEM -> regs -> FFMA =================
+   
     for (uint dotIdx = 0; dotIdx < BK; ++dotIdx) {
       for (uint i = 0; i < TM; ++i)
         regM[i] = As[dotIdx * BM + threadRow * TM + i];   
