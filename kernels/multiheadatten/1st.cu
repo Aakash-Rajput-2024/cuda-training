@@ -1,8 +1,8 @@
 #include <cuda_runtime.h>
 #include <math.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdbool.h>
 
 __global__ void compute_scores(const float *Q, const float *K, float *score,
                                int N, int d_model, int dk, int h_idx) {
@@ -165,21 +165,26 @@ bool check_correctness(const float *ref, const float *gpu, int total_elements,
 }
 
 int main(int argc, char **argv) {
-  int N = 512;        // Sequence length
-  int d_model = 512;  // Hidden dimension
-  int h = 8;          // Number of heads
+  int N = 512;       // Sequence length
+  int d_model = 512; // Hidden dimension
+  int h = 8;         // Number of heads
 
-  if (argc >= 2) N = atoi(argv[1]);
-  if (argc >= 3) d_model = atoi(argv[2]);
-  if (argc >= 4) h = atoi(argv[3]);
+  if (argc >= 2)
+    N = atoi(argv[1]);
+  if (argc >= 3)
+    d_model = atoi(argv[2]);
+  if (argc >= 4)
+    h = atoi(argv[3]);
 
   int dk = d_model / h;
   size_t bytes_qkv = (size_t)N * d_model * sizeof(float);
 
-  printf("===================================================================\n");
+  printf(
+      "===================================================================\n");
   printf("  Multi-Head Attention Benchmark: 1st (Baseline Naive)\n");
   printf("  Config: N=%d, d_model=%d, heads=%d, dk=%d\n", N, d_model, h, dk);
-  printf("===================================================================\n");
+  printf(
+      "===================================================================\n");
 
   float *h_Q = (float *)malloc(bytes_qkv);
   float *h_K = (float *)malloc(bytes_qkv);
@@ -248,11 +253,13 @@ int main(int argc, char **argv) {
   double flops = 4.0 * (double)N * (double)N * (double)d_model;
   double gflops = flops / (avg_ms * 1e6);
 
-  printf("-------------------------------------------------------------------\n");
+  printf(
+      "-------------------------------------------------------------------\n");
   printf("  Verification : %s\n", passed ? "PASS" : "FAIL");
   printf("  Avg Latency  : %.4f ms\n", avg_ms);
   printf("  Throughput   : %.2f GFLOP/s\n", gflops);
-  printf("-------------------------------------------------------------------\n");
+  printf(
+      "-------------------------------------------------------------------\n");
 
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
