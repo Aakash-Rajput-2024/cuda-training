@@ -67,7 +67,7 @@ extern "C" void solve(const float *Q, const float *K, const float *V,
   int dk = d_model / h;
 
   float *d_scores;
-  cudaMalloc(&d_scores, N * N * sizeof(float));
+  cudaMalloc(&d_scores, (size_t)N * N * sizeof(float));
 
   dim3 block16(16, 16);
   dim3 grid16((N + 15) / 16, (N + 15) / 16);
@@ -93,74 +93,97 @@ extern "C" void solve(const float *Q, const float *K, const float *V,
 // Host verification & benchmarking harness for Colab execution
 // ---------------------------------------------------------------------------
 
-void cpu_reference_mha(const float *Q, const float *K, const float *V,
-                       float *out_ref, int N, int d_model, int h) {
+bool verify_correctness(const float *h_Q, const float *h_K, const float *h_V,
+                        const float *gpu_out, int N, int d_model, int h,
+                        float tol) {
   int dk = d_model / h;
-  float *scores = (float *)malloc(N * N * sizeof(float));
   float scale = 1.0f / sqrtf((float)dk);
 
-  for (int h_idx = 0; h_idx < h; h_idx++) {
-    // 1. Q * K^T / sqrt(dk)
-    for (int r = 0; r < N; r++) {
-      for (int c = 0; c < N; c++) {
-        float sum = 0.0f;
-        int q_i = r * d_model + h_idx * dk;
-        int k_i = c * d_model + h_idx * dk;
-        for (int m = 0; m < dk; m++) {
-          sum += Q[q_i + m] * K[k_i + m];
-        }
-        scores[r * N + c] = sum * scale;
-      }
-    }
-
-    // 2. Softmax per row
-    for (int r = 0; r < N; r++) {
-      float max_val = scores[r * N];
-      for (int c = 1; c < N; c++) {
-        if (scores[r * N + c] > max_val) {
-          max_val = scores[r * N + c];
-        }
-      }
-      float sum = 0.0f;
-      for (int c = 0; c < N; c++) {
-        scores[r * N + c] = expf(scores[r * N + c] - max_val);
-        sum += scores[r * N + c];
-      }
-      for (int c = 0; c < N; c++) {
-        scores[r * N + c] /= sum;
-      }
-    }
-
-    // 3. scores * V
-    for (int r = 0; r < N; r++) {
-      for (int c = 0; c < dk; c++) {
-        float sum = 0.0f;
-        for (int k = 0; k < N; k++) {
-          sum += scores[r * N + k] * V[k * d_model + h_idx * dk + c];
-        }
-        out_ref[r * d_model + h_idx * dk + c] = sum;
-      }
-    }
-  }
-
-  free(scores);
-}
-
-bool check_correctness(const float *ref, const float *gpu, int total_elements,
-                       float tol) {
-  float max_diff = 0.0f;
-  for (int i = 0; i < total_elements; i++) {
-    float diff = fabsf(ref[i] - gpu[i]);
-    if (diff > max_diff) {
-      max_diff = diff;
-    }
-    if (diff > tol) {
-      printf("  [FAIL] Mismatch at index %d: ref=%.6f, gpu=%.6f, diff=%.6f\n",
-             i, ref[i], gpu[i], diff);
+  // 1. Sanity check: Ensure all GPU output elements are finite (no NaN, no Inf)
+  for (size_t i = 0; i < (size_t)N * d_model; i++) {
+    if (isnan(gpu_out[i]) || isinf(gpu_out[i])) {
+      printf("  [FAIL] GPU output contains NaN/Inf at index %zu!\n", i);
       return false;
     }
   }
-  printf("  [PASS] Max difference: %.6e (tolerance: %.6e)\n", max_diff, tol);
+
+  // 2. Mathematical CPU verification:
+  // For small N (<= 1024), check every row.
+  // For large N (stress test), check representative sample rows to keep verification sub-second
+  // and prevent host RAM overflow.
+  int num_sample_rows = 5;
+  int sample_rows[5];
+  if (N <= 1024) {
+    num_sample_rows = N;
+  } else {
+    sample_rows[0] = 0;
+    sample_rows[1] = N / 4;
+    sample_rows[2] = N / 2;
+    sample_rows[3] = 3 * N / 4;
+    sample_rows[4] = N - 1;
+  }
+
+  float *row_scores = (float *)malloc(N * sizeof(float));
+  if (!row_scores) {
+    fprintf(stderr, "Failed to allocate row_scores buffer\n");
+    return false;
+  }
+
+  float max_diff = 0.0f;
+
+  for (int s = 0; s < num_sample_rows; s++) {
+    int r = (N <= 1024) ? s : sample_rows[s];
+
+    for (int h_idx = 0; h_idx < h; h_idx++) {
+      int q_offset = r * d_model + h_idx * dk;
+      float max_val = -1e30f;
+
+      for (int c = 0; c < N; c++) {
+        float dot = 0.0f;
+        int k_offset = c * d_model + h_idx * dk;
+        for (int m = 0; m < dk; m++) {
+          dot += h_Q[q_offset + m] * h_K[k_offset + m];
+        }
+        float sc = dot * scale;
+        row_scores[c] = sc;
+        if (sc > max_val)
+          max_val = sc;
+      }
+
+      float sum_exp = 0.0f;
+      for (int c = 0; c < N; c++) {
+        row_scores[c] = expf(row_scores[c] - max_val);
+        sum_exp += row_scores[c];
+      }
+      for (int c = 0; c < N; c++) {
+        row_scores[c] /= sum_exp;
+      }
+
+      for (int c = 0; c < dk; c++) {
+        float ref_val = 0.0f;
+        for (int k = 0; k < N; k++) {
+          ref_val += row_scores[k] * h_V[k * d_model + h_idx * dk + c];
+        }
+        int out_idx = r * d_model + h_idx * dk + c;
+        float diff = fabsf(ref_val - gpu_out[out_idx]);
+        if (diff > max_diff)
+          max_diff = diff;
+
+        if (diff > tol) {
+          printf("  [FAIL] Mismatch at row %d, head %d, dim %d: ref=%.6f, "
+                 "gpu=%.6f, diff=%.6f\n",
+                 r, h_idx, c, ref_val, gpu_out[out_idx], diff);
+          free(row_scores);
+          return false;
+        }
+      }
+    }
+  }
+
+  free(row_scores);
+  printf("  [PASS] Mathematical verification successful (checked %d rows, "
+         "max diff: %.6e, tol: %.6e)\n",
+         num_sample_rows, max_diff, tol);
   return true;
 }
 
@@ -178,11 +201,14 @@ int main(int argc, char **argv) {
 
   int dk = d_model / h;
   size_t bytes_qkv = (size_t)N * d_model * sizeof(float);
+  size_t bytes_scores = (size_t)N * N * sizeof(float);
+  double total_gpu_gb = (4.0 * bytes_qkv + bytes_scores) / (1024.0 * 1024.0 * 1024.0);
 
   printf(
       "===================================================================\n");
   printf("  Multi-Head Attention Benchmark: 1st (Baseline Naive)\n");
   printf("  Config: N=%d, d_model=%d, heads=%d, dk=%d\n", N, d_model, h, dk);
+  printf("  Total GPU Memory Footprint: %.2f GB\n", total_gpu_gb);
   printf(
       "===================================================================\n");
 
@@ -190,16 +216,15 @@ int main(int argc, char **argv) {
   float *h_K = (float *)malloc(bytes_qkv);
   float *h_V = (float *)malloc(bytes_qkv);
   float *h_out = (float *)malloc(bytes_qkv);
-  float *h_ref = (float *)malloc(bytes_qkv);
 
-  if (!h_Q || !h_K || !h_V || !h_out || !h_ref) {
+  if (!h_Q || !h_K || !h_V || !h_out) {
     fprintf(stderr, "Host memory allocation failed\n");
     return 1;
   }
 
   // Deterministic initialization in [-0.5, 0.5]
   srand(42);
-  for (int i = 0; i < N * d_model; i++) {
+  for (size_t i = 0; i < (size_t)N * d_model; i++) {
     h_Q[i] = ((float)rand() / (float)RAND_MAX) - 0.5f;
     h_K[i] = ((float)rand() / (float)RAND_MAX) - 0.5f;
     h_V[i] = ((float)rand() / (float)RAND_MAX) - 0.5f;
@@ -216,18 +241,17 @@ int main(int argc, char **argv) {
   cudaMemcpy(d_V, h_V, bytes_qkv, cudaMemcpyHostToDevice);
 
   // 1. Correctness verification against CPU reference
-  printf("\n[1/2] Verifying correctness against CPU reference...\n");
+  printf("\n[1/2] Verifying correctness against reference...\n");
   solve(d_Q, d_K, d_V, d_out, N, d_model, h);
   cudaDeviceSynchronize();
   cudaMemcpy(h_out, d_out, bytes_qkv, cudaMemcpyDeviceToHost);
 
-  cpu_reference_mha(h_Q, h_K, h_V, h_ref, N, d_model, h);
-  bool passed = check_correctness(h_ref, h_out, N * d_model, 1e-3f);
+  bool passed = verify_correctness(h_Q, h_K, h_V, h_out, N, d_model, h, 1e-3f);
 
   // 2. Benchmarking with CUDA events
   printf("\n[2/2] Benchmarking...\n");
-  const int warmup_iters = 5;
-  const int bench_iters = 20;
+  int warmup_iters = (N >= 16384) ? 2 : 5;
+  int bench_iters = (N >= 16384) ? 5 : 20;
 
   for (int i = 0; i < warmup_iters; i++) {
     solve(d_Q, d_K, d_V, d_out, N, d_model, h);
@@ -271,7 +295,6 @@ int main(int argc, char **argv) {
   free(h_K);
   free(h_V);
   free(h_out);
-  free(h_ref);
 
   return passed ? 0 : 1;
 }
