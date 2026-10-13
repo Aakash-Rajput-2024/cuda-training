@@ -40,7 +40,6 @@ __global__ void matmul(float * Nd, float * Md, float * out, int N, int K, int M)
         out[row * M + col] = p;
     }
 }
-
 int main() {
     int N = 1024;
     int M = 1024;
